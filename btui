@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# btui — small whiptail front-end for bluetoothctl (pair/connect headsets & speakers)
+# Needs: bluez, whiptail
+# Env:   SCAN_SECS (initial scan length, default 10), NEWT_COLORS (optional custom theme)
+set -u
+
+TITLE="Bluetooth"
+SCAN_SECS=${SCAN_SECS:-10}
+MAC_RE='^([0-9A-F]{2}:){5}[0-9A-F]{2}$'
+NONAME_RE='^([0-9A-F]{2}-){5}[0-9A-F]{2}$'
+scan_pid=
+export BACKTITLE="btui"
+
+stop_scan() { [ -n "$scan_pid" ] && kill "$scan_pid" 2>/dev/null; scan_pid=; }
+trap stop_scan EXIT
+
+# ---------- helpers ----------
+bt() { bluetoothctl "$@" </dev/null 2>&1; }
+
+# Fit dialogs to the terminal (capped); recomputed on each call so resizes work.
+size() {
+  local r c
+  read -r r c < <(stty size </dev/tty 2>/dev/null || echo "24 80")
+  H=$(( r - 4 < 22 ? r - 4 : 22 )); W=$(( c - 6 < 76 ? c - 6 : 76 ))
+}
+wt()    { whiptail --title " $TITLE " --backtitle "$BACKTITLE" "$@"; }
+msg()   { size; wt --msgbox "$1" 14 "$W"; }
+info()  { size; wt --infobox "$1" 8 "$W"; }
+toast() { info "$1"; sleep 1.2; }
+yesno() { size; wt --yesno "$1" 10 "$W"; }
+
+# menu TEXT [whiptail opts…] -- TAG LABEL…   → prints the chosen tag
+menu() {
+  local text=$1 opts=() nl lh; shift
+  while [ "$1" != -- ]; do opts+=("$1"); shift; done; shift
+  nl=$(printf '%b' "$text" | wc -l)
+  size
+  lh=$(( $# / 2 )); (( lh > H - 8 - nl )) && lh=$(( H - 8 - nl )); (( lh < 2 )) && lh=2
+  whiptail --title " $TITLE " --backtitle "$BACKTITLE" --notags "${opts[@]}" \
+    --menu "$text" $(( lh + nl + 8 )) "$W" "$lh" "$@" 3>&1 1>&2 2>&3
+}
+
+is_on() { bt show | grep -q 'Powered: yes'; }
+has()   { bt info "$1" | grep -q "$2: yes"; }
+# on | off | off-blocked (rfkill) | off-enabling | on-disabling | "" (no adapter)
+power_state() { bt show | sed -n 's/^\s*PowerState: //p'; }
+
+# dev_info MAC → sets D_NAME D_TYPE D_BATT D_RSSI D_CONN
+dev_info() {
+  local i; i=$(bt info "$1")
+  D_NAME=$(sed -n 's/^\s*Name: //p' <<<"$i")
+  D_BATT=$(sed -n 's/^\s*Battery Percentage: .*(\([0-9]*\)).*/\1/p' <<<"$i")
+  D_RSSI=$(sed -n 's/^\s*RSSI: .*(\(-\?[0-9]*\)).*/\1/p; s/^\s*RSSI: \(-\?[0-9]*\)$/\1/p' <<<"$i")
+  [[ $i == *"Connected: yes"* ]] && D_CONN=1 || D_CONN=
+  local icon; icon=$(sed -n 's/^\s*Icon: //p' <<<"$i")
+  case $icon in
+    audio-headset)    D_TYPE=headset ;;
+    audio-headphones) D_TYPE=headphones ;;
+    audio-card)       D_TYPE=speaker ;;
+    input-keyboard)   D_TYPE=keyboard ;;
+    input-mouse)      D_TYPE=mouse ;;
+    input-gaming)     D_TYPE=gamepad ;;
+    *)                D_TYPE=${icon:-device} ;;
+  esac
+}
+
+bars() {
+  local r=${1:--999}
+  if   (( r >= -60 )); then echo "▂▄▆█"
+  elif (( r >= -70 )); then echo "▂▄▆ "
+  elif (( r >= -80 )); then echo "▂▄  "
+  elif (( r > -999 )); then echo "▂   "
+  else echo "    "; fi
+}
+
+# Unblock rfkill if needed, then power on. Shows why and returns 1 on failure.
+power_on() {
+  local out
+  if [ "$(power_state)" = off-blocked ]; then
+    if ! out=$(/usr/sbin/rfkill unblock bluetooth 2>&1); then
+      msg "Bluetooth is blocked by rfkill and unblocking failed:\n\n$out\n\nTry: sudo rfkill unblock bluetooth"
+      return 1
+    fi
+    sleep 1
+  fi
+  info "Turning Bluetooth on…"
+  out=$(bt power on)
+  is_on && return 0
+  if [ "$(power_state)" = off-blocked ]; then
+    msg "Bluetooth is still blocked by rfkill (hardware switch / BIOS / Fn key?).\n\nCheck: rfkill list bluetooth"
+  else
+    msg "Could not turn Bluetooth on:\n\n$(tail -n 5 <<<"$out")"
+  fi
+  return 1
+}
+
+# ---------- device lists (print "TAG\nLABEL\n" pairs) ----------
+list_paired() {   # connected devices first
+  local mac label first=() rest=()
+  while read -r _ mac _; do
+    [[ $mac =~ $MAC_RE ]] || continue
+    dev_info "$mac"
+    label=$(printf '%s  %-26.26s %-11s %s' "$([ -n "$D_CONN" ] && echo ● || echo ○)" \
+            "$D_NAME" "$D_TYPE" "${D_BATT:+bat $D_BATT%}")
+    if [ -n "$D_CONN" ]; then first+=("$mac" "$label"); else rest+=("$mac" "$label"); fi
+  done < <(bt devices Paired)
+  local all=("${first[@]}" "${rest[@]}")
+  (( ${#all[@]} )) && printf '%s\n' "${all[@]}"
+}
+
+list_unpaired() { # named devices only, strongest signal first
+  local paired mac
+  paired=$(bt devices Paired | awk '{print $2}')
+  while read -r _ mac _; do
+    [[ $mac =~ $MAC_RE ]] || continue
+    grep -qx "$mac" <<<"$paired" && continue
+    dev_info "$mac"
+    [[ -z $D_NAME || $D_NAME =~ $NONAME_RE ]] && continue
+    printf '%s\t%s\t%s  %-26.26s %s\n' "${D_RSSI:--999}" "$mac" "$(bars "$D_RSSI")" "$D_NAME" "$D_TYPE"
+  done < <(bt devices) | sort -t $'\t' -k1,1nr |
+  while IFS=$'\t' read -r _ mac label; do printf '%s\n%s\n' "$mac" "$label"; done
+}
+
+count_new() {
+  local all paired
+  all=$(bt devices | grep -Ev ' ([0-9A-F]{2}-){5}[0-9A-F]{2}$' | grep -c '^Device')
+  paired=$(bt devices Paired | grep -c '^Device')
+  echo $(( all - paired ))
+}
+
+scan_gauge() {    # $1 = seconds
+  local secs=$1 i
+  size
+  for (( i = 0; i <= secs * 2; i++ )); do
+    printf 'XXX\n%d\nPut your headset / speaker in pairing mode…\n\nFound %d new device(s)\nXXX\n' \
+      $(( i * 50 / secs )) "$(count_new)"
+    sleep 0.5
+  done | whiptail --title " Scanning " --backtitle "$BACKTITLE" --gauge "Starting scan…" 10 "$W" 0
+}
+
+# ---------- screens ----------
+paired_menu() {
+  local items mac action out details default=
+  while true; do
+    info "Loading devices…"
+    mapfile -t items < <(list_paired)
+    if (( ${#items[@]} == 0 )); then
+      msg "No paired devices yet.\n\nUse \"Pair new device\" from the main menu."; return
+    fi
+    mac=$(menu "Paired devices          ● connected   ○ not connected" \
+               --ok-button Select --cancel-button Back ${default:+--default-item "$default"} \
+               -- "${items[@]}") || return
+    default=$mac
+    dev_info "$mac"
+    details="$D_NAME\n\nType:     $D_TYPE\nAddress:  $mac\nStatus:   $([ -n "$D_CONN" ] && echo connected || echo not connected)${D_BATT:+\nBattery:  $D_BATT%}"
+    if [ -n "$D_CONN" ]; then
+      action=$(menu "$details" --ok-button Select --cancel-button Back -- \
+                 disconnect "Disconnect" remove "Forget this device") || continue
+    else
+      action=$(menu "$details" --ok-button Select --cancel-button Back -- \
+                 connect "Connect" remove "Forget this device") || continue
+    fi
+    case $action in
+      connect)
+        is_on || power_on || continue
+        info "Connecting to $D_NAME…"
+        out=$(bt connect "$mac")
+        if has "$mac" Connected; then toast "✔  Connected to $D_NAME"
+        else msg "Could not connect to $D_NAME.\nIs it switched on and in range?\n\n$(tail -n 3 <<<"$out")"; fi ;;
+      disconnect)
+        info "Disconnecting $D_NAME…"
+        out=$(bt disconnect "$mac")
+        if has "$mac" Connected; then msg "Disconnect failed:\n\n$(tail -n 3 <<<"$out")"
+        else toast "Disconnected $D_NAME"; fi ;;
+      remove)
+        yesno "Forget $D_NAME?\n\nYou will need to pair it again to use it." || continue
+        out=$(bt remove "$mac"); default=
+        if grep -qi removed <<<"$out"; then toast "Forgot $D_NAME"
+        else msg "Could not remove $D_NAME:\n\n$(tail -n 3 <<<"$out")"; fi ;;
+    esac
+  done
+}
+
+scan_pair() {
+  local items mac out text
+  # Keep discovery running in the background while the user picks a device
+  bluetoothctl --timeout 300 scan on </dev/null >/dev/null 2>&1 &
+  scan_pid=$!
+  scan_gauge "$SCAN_SECS"
+  while true; do
+    info "Loading devices…"
+    mapfile -t items < <(list_unpaired)
+    if (( ${#items[@]} )); then
+      text="Select your device (nearest first). Scanning continues in the background."
+    else
+      text="No devices found yet.\nMake sure it is in pairing mode (often: hold the power\nor Bluetooth button until the light flashes)."
+    fi
+    mac=$(menu "$text" --ok-button Select --cancel-button Back -- \
+               rescan "↻  Scan again" "${items[@]}") || break
+    [ "$mac" = rescan ] && { scan_gauge 5; continue; }
+    dev_info "$mac"
+    info "Pairing with $D_NAME…"
+    # No interactive agent: "just works" pairing only (no PIN / passkey entry)
+    out=$(bt --agent NoInputNoOutput --timeout 90 pair "$mac")
+    if ! has "$mac" Paired; then
+      msg "Pairing with $D_NAME failed:\n\n$(tail -n 5 <<<"$out")"; continue
+    fi
+    bt trust "$mac" >/dev/null
+    info "Paired. Connecting to $D_NAME…"
+    out=$(bt connect "$mac")
+    if has "$mac" Connected; then toast "✔  $D_NAME paired and connected"
+    else msg "$D_NAME is paired, but connecting failed:\n\n$(tail -n 5 <<<"$out")\n\nTry again from \"Devices\"."; fi
+    break
+  done
+  stop_scan
+}
+
+# ---------- main ----------
+# Allow sourcing (for tests) without starting the UI.
+[[ ${BASH_SOURCE[0]} != "$0" ]] && return 0
+
+last=
+while true; do
+  state=$(power_state)
+  case $state in on*) toggle=off ;; *) toggle=on ;; esac
+  adapter=$(bt show)
+  BACKTITLE="btui  ·  $(sed -n 's/^\s*Alias: //p' <<<"$adapter") ($(sed -n '1s/^Controller \([0-9A-F:]*\).*/\1/p' <<<"$adapter"))"
+  case $state in
+    on)          hdr="Bluetooth is ON" ;;
+    off)         hdr="Bluetooth is OFF" ;;
+    off-blocked) hdr="Bluetooth is OFF (blocked by rfkill; turning it on will unblock it)" ;;
+    "")          hdr="No Bluetooth adapter found"; BACKTITLE="btui" ;;
+    *)           hdr="Bluetooth is ${state^^}" ;;
+  esac
+  conn=$(bt devices Connected | grep '^Device' | cut -d' ' -f3- | paste -sd, | sed 's/,/, /g')
+  [ -n "$conn" ] && hdr+="\nConnected: $conn"
+  choice=$(menu "$hdr" --ok-button Select --cancel-button Quit ${last:+--default-item "$last"} -- \
+    paired "  Devices            connect · disconnect · forget" \
+    scan   "  Pair new device    headset, speaker, …" \
+    power  "  Turn Bluetooth $toggle") || break
+  last=$choice
+  case $choice in
+    paired) paired_menu ;;
+    scan)   { is_on || power_on; } && scan_pair ;;
+    power)  if [ $toggle = on ]; then power_on && toast "Bluetooth is on"
+            else out=$(bt power off); is_on && msg "$out"; fi ;;
+  esac
+done
+clear
