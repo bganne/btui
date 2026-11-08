@@ -12,6 +12,12 @@ scan_pid=
 export BACKTITLE="btui"
 
 stop_scan() { [ -n "$scan_pid" ] && kill "$scan_pid" 2>/dev/null; scan_pid=; }
+# Keep discovery running in the background while the user picks a device
+start_scan() {
+  [ -n "$scan_pid" ] && return
+  bluetoothctl --timeout 300 scan on </dev/null >/dev/null 2>&1 &
+  scan_pid=$!
+}
 trap stop_scan EXIT
 
 # ---------- helpers ----------
@@ -183,9 +189,7 @@ paired_menu() {
 
 scan_pair() {
   local items mac out text
-  # Keep discovery running in the background while the user picks a device
-  bluetoothctl --timeout 300 scan on </dev/null >/dev/null 2>&1 &
-  scan_pid=$!
+  start_scan
   scan_gauge "$SCAN_SECS"
   while true; do
     info "Loading devices…"
@@ -197,13 +201,19 @@ scan_pair() {
     fi
     mac=$(menu "$text" --ok-button Select --cancel-button Back -- \
                rescan "↻  Scan again" "${items[@]}") || break
-    [ "$mac" = rescan ] && { scan_gauge 5; continue; }
+    [ "$mac" = rescan ] && { start_scan; scan_gauge 5; continue; }
     dev_info "$mac"
     info "Pairing with $D_NAME…"
+    # Inquiry running during paging/pairing can stall it for tens of seconds
+    stop_scan
+    # Not pairable = the kernel requests "no bonding": the link key is not stored
+    # by either side and the pairing is lost on disconnect
+    bt pairable on >/dev/null
     # No interactive agent: "just works" pairing only (no PIN / passkey entry)
-    out=$(bt --agent NoInputNoOutput --timeout 90 pair "$mac")
+    # not bluetoothctl --timeout: that always waits the full delay, even on success
+    out=$(timeout 90 bluetoothctl --agent NoInputNoOutput pair "$mac" </dev/null 2>&1)
     if ! has "$mac" Paired; then
-      msg "Pairing with $D_NAME failed:\n\n$(tail -n 5 <<<"$out")"; continue
+      msg "Pairing with $D_NAME failed:\n\n$(tail -n 5 <<<"$out")"; start_scan; continue
     fi
     bt trust "$mac" >/dev/null
     info "Paired. Connecting to $D_NAME…"
